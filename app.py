@@ -10,7 +10,9 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import time
+import threading
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI
 from pydantic import BaseModel
 from selenium import webdriver
@@ -79,6 +81,102 @@ def create_driver():
 
     return driver
 
+
+# =========================
+# CACHE
+# =========================
+def load_cache():
+    if os.path.exists("cache.json"):
+        with open("cache.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_cache(cache):
+    with open("cache.json", "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+        
+def scrape_with_retry(url, retries=3):
+    for attempt in range(retries):
+        try:
+            result = scrape(url)
+
+            if "error" not in result:
+                return result
+
+        except Exception as e:
+            print(f"⚠️ Retry {attempt+1} error:", e)
+
+        time.sleep(random.uniform(2, 5))
+
+    return {
+        "error": "max retries reached",
+        "url": url
+    }
+
+lock = threading.Lock()
+
+def process_url(url, cache):
+    if url in cache:
+        print(f"⚡ Cache hit: {url}")
+        return cache[url]
+
+    print(f"🔎 Scraping: {url}")
+
+    result = scrape_with_retry(url)
+
+    with lock:
+        cache[url] = result
+        save_cache(cache)
+
+    return result
+
+def run_crawler(max_workers=5):
+    urls = list(set(load_urls_from_txt()))
+    cache = load_cache()
+
+    print(f"\n🚀 Total URLs: {len(urls)}")
+    print(f"⚡ Workers: {max_workers}\n")
+
+    results = []
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_url, url, cache): url
+            for url in urls
+        }
+
+        for future in as_completed(futures):
+            url = futures[future]
+
+            try:
+                result = future.result()
+
+                if "error" in result:
+                    print(f"❌ {url}")
+                else:
+                    print(f"✅ {result.get('name')}")
+
+                results.append(result)
+
+                # 🔥 guardado incremental excel
+                if len(results) % 3 == 0:
+                    save_excel(results)
+
+            except Exception as e:
+                print(f"💥 Thread error: {e}")
+
+    # =========================
+    # 💾 EXPORT FINAL
+    # =========================
+    file = save_excel(results)
+
+    print("\n📦 Export final:")
+    print(file)
+
+    return results
+
+
+
 # =========================
 # reimplemetation with direct api
 # =========================
@@ -126,6 +224,55 @@ def extract_product_id(url):
     match = re.search(r'item-(\d+)', url)
     return match.group(1) if match else None
 
+def load_urls_from_txt(filepath="products.txt"):
+    if not os.path.exists(filepath):
+        raise Exception(f"No existe {filepath}")
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        urls = [line.strip() for line in f.readlines() if line.strip()]
+
+    return urls
+
+def run_from_txt():
+    urls = load_urls_from_txt()
+
+    print(f"🚀 Procesando {len(urls)} productos...\n")
+
+    results = []
+
+    for i, url in enumerate(urls, 1):
+        print(f"\n🔎 [{i}/{len(urls)}] {url}")
+
+        try:
+            product = scrape(url)
+
+            # 🔥 validar error
+            if "error" in product:
+                print(f"❌ Error: {product['error']}")
+            else:
+                print(f"✅ OK: {product.get('name')}")
+
+            results.append(product)
+
+        except Exception as e:
+            print(f"💥 Exception: {e}")
+            results.append({
+                "error": str(e),
+                "url": url
+            })
+
+        # 🔥 delay humano (anti-bloqueo)
+        time.sleep(random.uniform(2, 4))
+
+    # =========================
+    # 💾 EXPORT EXCEL
+    # =========================
+    file = save_excel(results)
+
+    print("\n📦 Export completo:")
+    print(file)
+
+    return results
 
 def fetch_product_api(url):
     product_id = extract_product_id(url)
@@ -415,8 +562,12 @@ PROXIES = [
 ]
 
 def get_proxy():
-    return {"http": random.choice(PROXIES)}   
-    
+    return {
+        "http": random.choice(PROXIES),
+        "https": random.choice(PROXIES)
+    }
+
+
 MODEL_CLASSES = [
     "Zapatillas",
     "Tacones",
@@ -1312,6 +1463,7 @@ def scrape_api(req: ScrapeRequest):
         results.append(scrape(url))
 
     file = save_excel(results)
+    save_excel(results, filepath="exports/partial.xlsx")
 
     return {
         "status": "ok",
@@ -1319,3 +1471,6 @@ def scrape_api(req: ScrapeRequest):
         "file": file,
         "data": results
     }
+    
+   
+if __name__ == "__main__": run_crawler(max_workers=5)
