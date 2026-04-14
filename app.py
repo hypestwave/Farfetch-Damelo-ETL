@@ -1,4 +1,3 @@
-import time
 import uuid
 import re
 import os
@@ -9,7 +8,8 @@ import requests
 import pandas as pd
 import cv2
 import numpy as np
-
+import onnxruntime as ort
+import time
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -35,6 +35,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17 Safari/605.1.15",
 ]
+
 
 
 def get_headers():
@@ -79,6 +80,118 @@ def create_driver():
     return driver
 
 # =========================
+# reimplemetation with direct api
+# =========================
+
+MODEL_PATH = "shoe_classifier.onnx"
+session = None
+
+def get_onnx_session():
+    global session
+
+    if session is None:
+        if not os.path.exists(MODEL_PATH):
+            return None
+        session = ort.InferenceSession(MODEL_PATH)
+
+    return session
+
+
+def preprocess(img_path):
+    img = cv2.imread(img_path)
+    img = cv2.resize(img, (224, 224))
+    img = img.astype(np.float32) / 255.0
+    img = np.transpose(img, (2, 0, 1))
+    return np.expand_dims(img, axis=0)
+
+def classify_shoe_onnx(image_path):
+    try:
+        sess = get_onnx_session()
+
+        if sess is None:
+            return "Zapatillas"  # fallback
+
+        input_tensor = preprocess(image_path)
+
+        outputs = sess.run(None, {"input": input_tensor})
+        probs = outputs[0][0]
+
+        idx = np.argmax(probs)
+        return SHOE_CATEGORIES[idx]
+
+    except:
+        return "Zapatillas"
+
+def extract_product_id(url):
+    match = re.search(r'item-(\d+)', url)
+    return match.group(1) if match else None
+
+
+def fetch_product_api(url):
+    product_id = extract_product_id(url)
+
+    api_url = f"https://www.farfetch.com/api/product/{product_id}"
+
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json",
+        "Referer": url
+    }
+
+    r = requests.get(api_url, headers=headers)
+
+    if r.status_code != 200:
+        return None
+
+    data = r.json()
+
+    return data
+
+def parse_product_api(data):
+    product = data.get("product", {})
+
+    name = product.get("shortDescription", "")
+    brand = product.get("brand", {}).get("name", "")
+    price = product.get("price", {}).get("value", 0)
+
+    images = [
+        img.get("url")
+        for img in product.get("images", [])
+    ]
+
+    sizes = []
+    quantities = []
+
+    for variant in product.get("variants", []):
+        size = variant.get("size", {}).get("name")
+        stock = variant.get("stock", {}).get("quantity", 0)
+
+        if size:
+            sizes.append(size)
+            quantities.append(stock if stock else 0)
+
+    return {
+        "name": name,
+        "brand": brand,
+        "price": price,
+        "images": images,
+        "sizes": sizes,
+        "quantities": quantities
+    }
+    
+SHOE_CATEGORIES = [
+    "Tacones", "Botas", "Mocasines", "Mules",
+    "Zapatillas", "Sandalias", "Bailarinas",
+    "Chanclas", "Pantuflas",
+    
+    # 🔥 extras recomendadas
+    "Sneakers", "Loafers", "Derby",
+    "Oxford", "Slides", "Clogs",
+    "Espadrilles", "Ankle Boots",
+    "Knee Boots"
+]
+
+# =========================
 # categories of shoes
 # =========================
 VALID_SHOE_TYPES = [
@@ -108,44 +221,20 @@ VALID_SHOE_TYPES = [
 # =========================
 # OPENCV
 # =========================
-def fallback_product_type(name, details):
-    text = f"{name} {' '.join(details.get('features', []))}".lower()
+def get_product_type_final(name, details, images):
+    # 1. REGLAS y OLLAMA  (rápido y preciso)
+    result = get_product_type_hybrid(name, details)
+    if result and result != ["Shoes"]:
+        return result
 
-    if "tacón" in text:
-        return ["Tacones"]
-    if "bota" in text:
-        return ["Botas"]
-    if "sandalia" in text:
-        return ["Sandalias"]
-    if "zapat" in text or "sneaker" in text:
-        return ["Zapatillas"]
-    if "mocas" in text:
-        return ["Mocasines"]
-    if "chancla" in text:
-        return ["Chanclas"]
+    # 3. ONNX (solo si existe)
+    if USE_ONNX and images:
+        vision = detect_product_type_from_image(images)
+        if vision:
+            return vision
 
     return ["Zapatillas"]
 
-def get_product_type(images, name, brand, details):
-    # 🔥 1. OpenCV
-    visual_features = {}
-
-    if images:
-        visual_features = extract_visual_features(images[0].lstrip("/"))
-
-    # 🔥 2. Ollama (IA real)
-    ai_result = classify_with_ollama(
-        name,
-        brand,
-        details,
-        visual_features
-    )
-
-    if ai_result:
-        return ai_result
-
-    # 🔥 3. fallback
-    return fallback_product_type(name, details)
 
 def classify_with_ollama(name, brand, details, visual_features):
     try:
@@ -237,10 +326,76 @@ def preprocess_image(image_path):
 
     return img
 
+def process_product(url):
+    data = fetch_product_api(url)
+
+    if not data:
+        return {"error": "API failed"}
+
+    parsed = parse_product_api(data)
+
+    product_id = str(uuid.uuid4())[:8]
+
+    # 🔥 descargar imagen principal
+    img_url = parsed["images"][0]
+    img_path = f"images/{product_id}.jpg"
+    download_image(img_url, img_path)
+
+    # 🔥 clasificación IA
+    category = classify_shoe_onnx(img_path)
+
+    # 🔥 descripción IA local
+    details = {
+        "features": [],
+        "composition": [],
+        "extra": []
+    }
+
+    description = generate_description_ollama_pro(
+        parsed["name"],
+        parsed["brand"],
+        details,
+        [],
+        category
+    )
+
+    return {
+        "id": product_id,
+        "name": parsed["name"],
+        "trade": parsed["brand"],
+        "price": parsed["price"],
+        "images": parsed["images"],
+        "size": parsed["sizes"],
+        "quantity": parsed["quantities"],
+        "productType": [category],
+        "description": description,
+        "currency": "USD",
+        "available": True
+    }
 # import onnxruntime as ort
 # MODEL_PATH = "shoe_classifier.onnx"
 # session = ort.InferenceSession(MODEL_PATH)
 
+
+def get_stealth_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive"
+    }
+
+def human_delay():
+    time.sleep(random.uniform(2, 5))
+
+PROXIES = [
+    "http://user:pass@ip1:port",
+    "http://user:pass@ip2:port"
+]
+
+def get_proxy():
+    return {"http": random.choice(PROXIES)}   
+    
 MODEL_CLASSES = [
     "Zapatillas",
     "Tacones",
@@ -275,7 +430,9 @@ def get_product_type_hybrid(name, details, images=None):
     import re
 
     text = f"{name} {' '.join(details.get('features', []))}".lower()
-
+    
+    
+    
     # =========================
     # 1. REGLAS (FAST PATH)
     # =========================
@@ -300,7 +457,6 @@ def get_product_type_hybrid(name, details, images=None):
     # =========================
     try:
         import requests
-
         prompt = f"""
 Clasifica el tipo de calzado en UNA categoría válida.
 
@@ -353,8 +509,12 @@ def detect_product_type_from_image(image_paths):
         if img is None:
             return []
 
-        inputs = {session.get_inputs()[0].name: img}
-        outputs = session.run(None, inputs)
+        sess = get_onnx_session()
+        if not sess:
+            return []
+
+        inputs = {sess.get_inputs()[0].name: img}
+        outputs = sess.run(None, inputs)
 
         probs = outputs[0][0]
         idx = int(np.argmax(probs))
@@ -381,22 +541,6 @@ def detect_product_type_fallback(name, details):
         return ["Mocasines"]
 
     return ["Zapatillas"]
-
-
-def get_product_type(images, name, details):
-    # 1. visión
-    visual = detect_product_type_from_image(images)
-
-    if visual:
-        return visual
-
-    # 2. fallback texto
-    fallback = detect_product_type_fallback(name, details)
-
-    return fallback
-
-
-
 
 # =========================
 # SCRAPER HELPERS
@@ -448,29 +592,7 @@ def get_price(driver):
         pass
 
     return 0
-
-def normalize_for_excel(product):
-    return {
-        "name": product.get("name", ""),
-        "trade": product.get("trade", ""),
-        "department": product.get("department", "Women"),
-        "price": product.get("price", 0),
-        "currency": product.get("currency", "USD"),
-        "available": str(product.get("available", True)).lower(),
-        "description": product.get("description", ""),
-        "image": product.get("image", ""),
-        "images": "|".join(product.get("images", [])),
-        "productType": "|".join(product.get("productType", [])),
-        "size": "|".join(product.get("size", [])),
-        "quantity": "|".join([str(q) for q in product.get("quantity", [])]),
-        "colors": "|".join([
-            f"{c.get('name')}:{c.get('hex')}"
-            for c in product.get("colors", [])
-        ]),
-        "details": "|".join(product.get("details", [])),
-    }
-    
-    
+  
 def get_brand(driver):
     selectors = [
         "//a[@data-ffref='pp_infobrd']",
@@ -640,16 +762,17 @@ def scrape(url):
         details = build_details_array(accordion_data)
         ai = analyze_images(images, name, brand)
         colors = parse_colors(ai.get("colors", "")) or []
-        product_type = get_product_type_hybrid(
+        product_type = get_product_type_final(
             name,
             accordion_data,
             images
         )
-        description = generate_description_local(
+        description = generate_description_ollama_pro(
             name,
             brand,
             accordion_data,
-            colors
+            colors,
+            product_type[0] if product_type else "Shoes"
         )
         return {
             "id": product_id,
@@ -684,108 +807,93 @@ def scrape(url):
 # =========================
 # SIZES
 # =========================
+
 def get_sizes_advanced(driver):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    import time
 
     sizes = []
     quantities = []
-    size_map_output = []
 
-    def normalize_size(text):
-        return text.replace("EU", "").replace("US", "").strip()
-
-    def map_size(eu):
-        return SIZE_MAP.get(eu, {"US": "", "UK": ""})
-
-    # =========================
-    # 1. DROPDOWN (PRIORIDAD)
-    # =========================
     try:
-        dropdown = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "[role='combobox']")
-            )
+        # =========================
+        # 1. ABRIR DROPDOWN
+        # =========================
+        dropdown = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-component='SizeSelectorLabel']"))
         )
 
         driver.execute_script("arguments[0].click();", dropdown)
 
-        options = WebDriverWait(driver, 5).until(
-            EC.presence_of_all_elements_located(
-                (By.XPATH, "//*[@role='option']")
-            )
-        )
+        time.sleep(1.5)  # 🔥 necesario (React render)
+
+        # =========================
+        # 2. CAPTURAR TODAS LAS OPCIONES VISIBLES
+        # =========================
+        options = driver.find_elements(By.XPATH, "//div[contains(text(),'US') or contains(text(),'EU')]")
 
         for opt in options:
             text = opt.text.strip()
+
             if not text:
                 continue
 
-            size = normalize_size(text)
+            # 🔥 EJEMPLO:
+            # "9.5 US men Última pieza"
+            # "11.5 US men"
 
-            # 🔥 STOCK REAL
-            disabled = opt.get_attribute("aria-disabled")
-            out_of_stock = disabled == "true" or "agotado" in text.lower()
+            # =========================
+            # SIZE LIMPIA (SIN TOCAR FORMATO)
+            # =========================
+            size_match = re.search(r'(\d+(\.\d+)?)\s*(US|EU|UK)', text)
+
+            if not size_match:
+                continue
+
+            size = size_match.group(0)  # 🔥 MANTENER EXACTO
+
+            # evitar duplicados
+            if size in sizes:
+                continue
 
             sizes.append(size)
-            quantities.append(0 if out_of_stock else 5)
 
-            mapped = map_size(size)
-            size_map_output.append({
-                "EU": size,
-                "US": mapped["US"],
-                "UK": mapped["UK"]
-            })
+            # =========================
+            # STOCK REAL
+            # =========================
+            if "última pieza" in text.lower():
+                quantities.append(1)
+            elif "agotado" in text.lower():
+                quantities.append(0)
+            else:
+                quantities.append(5)
 
-        return sizes, quantities, size_map_output
+        # =========================
+        # VALIDACIÓN
+        # =========================
+        if sizes:
+            return sizes, quantities, []
 
-    except:
-        pass
+    except Exception as e:
+        print("Error sizes dropdown:", e)
 
     # =========================
-    # 2. BOTONES (FALLBACK)
+    # FALLBACK API (MEJOR OPCIÓN)
     # =========================
     try:
-        buttons = driver.find_elements(By.XPATH, "//button[contains(@data-testid,'size')]")
+        url = driver.current_url
+        data = fetch_product_api(url)
 
-        for btn in buttons:
-            text = btn.text.strip()
-            if not text:
-                continue
-
-            size = normalize_size(text)
-
-            # 🔥 STOCK REAL
-            disabled = btn.get_attribute("disabled")
-            aria_disabled = btn.get_attribute("aria-disabled")
-
-            out_of_stock = (
-                disabled is not None or
-                aria_disabled == "true" or
-                "agotado" in text.lower()
-            )
-
-            sizes.append(size)
-            quantities.append(0 if out_of_stock else 5)
-
-            mapped = map_size(size)
-            size_map_output.append({
-                "EU": size,
-                "US": mapped["US"],
-                "UK": mapped["UK"]
-            })
-
-        if sizes:
-            return sizes, quantities, size_map_output
+        if data:
+            parsed = parse_product_api(data)
+            return parsed["sizes"], parsed["quantities"], []
 
     except:
         pass
 
-    # =========================
-    # 3. FALLBACK FINAL
-    # =========================
-    return ["M"], [5], [{"EU": "M", "US": "", "UK": ""}]
+    return ["M"], [5], []
 
 # =========================
 # DESCRIPTION
@@ -833,130 +941,118 @@ def get_product_details_from_accordion(driver):
 
     return details
 
+def build_product_context(name, brand, details, colors, category):
+    text = f"{name} {' '.join(details.get('features', []))}".lower()
 
-def generate_description_llm(name, brand, details, colors):
+    # 🎯 DETECCIÓN DE SEGMENTO
+    segment = "casual"
+
+    if any(k in text for k in ["running", "sport", "trainer", "tenis", "zapat"]):
+        segment = "sport"
+    elif any(k in text for k in ["cuero", "leather", "italy", "hecho en"]):
+        segment = "luxury"
+
+    # 🎨 COLOR
+    color = ""
+    if colors:
+        color = colors[0].get("name", "")
+
+    # 🧵 MATERIAL
+    material = ""
+    if details.get("composition"):
+        material = details["composition"][0]
+
+    return {
+        "name": name,
+        "brand": brand,
+        "category": category,
+        "features": details.get("features", [])[:4],
+        "material": material,
+        "color": color,
+        "segment": segment
+    }
+    
+def get_brand_tone(brand):
+    brand = brand.lower()
+
+    if any(b in brand for b in ["gucci", "prada", "balenciaga", "valentino"]):
+        return "lujo, sofisticado, exclusivo, editorial"
+    
+    if any(b in brand for b in ["nike", "adidas", "puma", "reebok"]):
+        return "dinámico, deportivo, energético"
+    
+    if any(b in brand for b in ["zara", "h&m", "mango"]):
+        return "moderno, accesible, tendencia"
+    
+    return "premium, elegante, contemporáneo"
+
+def generate_description_ollama_pro(name, brand, details, colors, category):
     import requests
 
+    ctx = build_product_context(name, brand, details, colors, category)
+    tone = get_brand_tone(brand)
+
     prompt = f"""
-Eres experto en ecommerce de moda.
+- Inicia con una frase emocional o sensorial
+Eres experto en ecommerce de moda de alto nivel (estilo Farfetch).
 
-Genera una descripción de producto entre 150 y 300 caracteres.
+Genera una descripción de producto entre 180 y 260 caracteres.
 
-Producto: {name}
-Marca: {brand}
-Características: {', '.join(details.get('features', []))}
-Materiales: {', '.join(details.get('composition', []))}
-Colores: {', '.join([c.get('name','') for c in colors])}
-
-Reglas:
-- No inventar
-- Lenguaje comercial
-- Aplicable a cualquier tipo de producto
+⚠️ REGLAS:
 - Español neutro
+- No inventar información
+- No repetir marca más de una vez
+- No usar palabras genéricas como "producto"
+- Texto fluido, emocional y comercial
+- Incluir storytelling corto
 
-Respuesta:
+🎯 CONTEXTO:
+Marca: {ctx["brand"]}
+Producto: {ctx["name"]}
+Categoría: {ctx["category"]}
+Segmento: {ctx["segment"]}
+Tono: {tone}
+
+Características:
+{", ".join(ctx["features"])}
+
+Material:
+{ctx["material"]}
+
+Color:
+{ctx["color"]}
+
+💡 OBJETIVO:
+- Si es luxury → enfatizar exclusividad, diseño, herencia
+- Si es sport → enfatizar rendimiento, comodidad, dinamismo
+- Si es casual → versatilidad y estilo diario
+
+✍️ RESPUESTA:
 """
 
     try:
         res = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "mistral",
+                "model": "mistral",  # puedes probar llama3 también
                 "prompt": prompt,
                 "stream": False
             },
-            timeout=10
+            timeout=15
         )
 
-        return res.json().get("response", "").strip()
+        output = res.json().get("response", "").strip()
+
+        # 🔥 limpieza básica
+        if len(output) < 80:
+            raise Exception("Respuesta débil")
+
+        return output[:300]
 
     except Exception:
-        return ""
-
-def generate_description_local(name, brand, details, colors=None):
-    import random
-
-    details = details or {}
-    colors = colors or []
-
-    features = details.get("features", [])
-    composition = details.get("composition", [])
-    extra = details.get("extra", [])
-
-    # =========================
-    # 🧠 DETECCIÓN DE CATEGORÍA
-    # =========================
-    text = f"{name} {' '.join(features)}".lower()
-
-    category = "producto"
-    if any(k in text for k in ["zapat", "sneaker", "tenis"]):
-        category = "calzado deportivo"
-    elif any(k in text for k in ["tacón", "heel"]):
-        category = "calzado de tacón"
-    elif any(k in text for k in ["bota"]):
-        category = "botas"
-    elif any(k in text for k in ["bolso", "bag"]):
-        category = "bolso"
-    elif any(k in text for k in ["camisa", "shirt"]):
-        category = "prenda superior"
-
-    # =========================
-    # 🎨 COLOR
-    # =========================
-    color = ""
-    if colors:
-        color = colors[0].get("name", "")
-    elif features:
-        color = features[0]
-
-    # =========================
-    # 🧵 MATERIAL
-    # =========================
-    material = ""
-    if composition:
-        material = composition[0].lower()
-
-    # =========================
-    # 🇮🇹 ORIGEN
-    # =========================
-    origin = next((e for e in extra if "Hecho en" in e), "")
-
-    # =========================
-    # ✨ DESCRIPCIÓN BASE
-    # =========================
-    templates = [
-        f"{brand} presenta {name}, un {category} que combina diseño contemporáneo y sofisticación.",
-        f"{name} de {brand} destaca por su estética refinada y construcción de alta calidad.",
-        f"Con el sello distintivo de {brand}, {name} redefine el estilo en {category}.",
-    ]
-
-    desc = random.choice(templates)
-
-    # enriquecer
-    if features:
-        desc += f" Incorpora detalles como {', '.join(features[:2])}."
-
-    if color:
-        desc += f" Su tonalidad {color} aporta versatilidad y elegancia."
-
-    if material:
-        desc += f" Fabricado con {material}."
-
-    if origin:
-        desc += f" {origin}."
-
-    desc += " Ideal para elevar cualquier look con un toque distintivo."
-
-    # =========================
-    # 🤖 FALLBACK LLM SI ES DÉBIL
-    # =========================
-    if len(desc) < 120:
-        llm_desc = generate_description_local(name, brand, details, colors)
-        if llm_desc:
-            return llm_desc[:300]
-
-    return desc[:300]
-
+        return f"{name} de {brand}, diseño sofisticado que combina estilo y funcionalidad para destacar en cualquier ocasión."
+    
+    
 def build_details_array(details):
     result = []
 
