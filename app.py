@@ -147,12 +147,13 @@ def fetch_product_api(url):
 
     return data
 
+###new function
 def parse_product_api(data):
     product = data.get("product", {})
-
     name = product.get("shortDescription", "")
     brand = product.get("brand", {}).get("name", "")
-    price = product.get("price", {}).get("value", 0)
+
+    base_price = product.get("price", {}).get("value", 0)
 
     images = [
         img.get("url")
@@ -161,24 +162,43 @@ def parse_product_api(data):
 
     sizes = []
     quantities = []
+    prices = []
 
     for variant in product.get("variants", []):
         size = variant.get("size", {}).get("name")
         stock = variant.get("stock", {}).get("quantity", 0)
 
+        # 🔥 PRECIO POR VARIANTE
+        variant_price = variant.get("price", {}).get("value")
+
         if size:
             sizes.append(size)
             quantities.append(stock if stock else 0)
 
+            if variant_price:
+                prices.append(variant_price)
+
+    # =========================
+    # 🔥 LÓGICA CLAVE
+    # =========================
+    final_price = base_price
+
+    if prices:
+        max_variant_price = max(prices)
+
+        # 👉 si hay una talla más cara → usar ese precio
+        if max_variant_price > base_price:
+            final_price = max_variant_price
+
     return {
         "name": name,
         "brand": brand,
-        "price": price,
+        "price": final_price,
         "images": images,
         "sizes": sizes,
         "quantities": quantities
     }
-    
+ 
 SHOE_CATEGORIES = [
     "Tacones", "Botas", "Mocasines", "Mules",
     "Zapatillas", "Sandalias", "Bailarinas",
@@ -228,6 +248,7 @@ def get_product_type_final(name, details, images):
         return result
 
     # 3. ONNX (solo si existe)
+    USE_ONNX = False
     if USE_ONNX and images:
         vision = detect_product_type_from_image(images)
         if vision:
@@ -807,32 +828,45 @@ def scrape(url):
 # =========================
 # SIZES
 # =========================
-
 def get_sizes_advanced(driver):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     import time
+    import re
 
     sizes = []
     quantities = []
+    prices = []
 
     try:
         # =========================
-        # 1. ABRIR DROPDOWN
+        # 1. ABRIR SELECTOR
         # =========================
-        dropdown = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-component='SizeSelectorLabel']"))
+        selector = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "[data-component='SizeSelectorLabel']")
+            )
         )
 
-        driver.execute_script("arguments[0].click();", dropdown)
+        driver.execute_script("arguments[0].click();", selector)
 
-        time.sleep(1.5)  # 🔥 necesario (React render)
+        # 🔥 esperar render REAL (no sleep fijo)
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_all_elements_located(
+                (By.XPATH, "//li | //div[@role='option']")
+            )
+        )
+
+        time.sleep(1)  # micro delay para React hydration
 
         # =========================
-        # 2. CAPTURAR TODAS LAS OPCIONES VISIBLES
+        # 2. CAPTURAR OPCIONES
         # =========================
-        options = driver.find_elements(By.XPATH, "//div[contains(text(),'US') or contains(text(),'EU')]")
+        options = driver.find_elements(
+            By.XPATH,
+            "//li | //div[@role='option']"
+        )
 
         for opt in options:
             text = opt.text.strip()
@@ -840,47 +874,62 @@ def get_sizes_advanced(driver):
             if not text:
                 continue
 
-            # 🔥 EJEMPLO:
-            # "9.5 US men Última pieza"
-            # "11.5 US men"
-
             # =========================
-            # SIZE LIMPIA (SIN TOCAR FORMATO)
+            # 🔥 EXTRAER SIZE COMPLETA (SIN NORMALIZAR)
             # =========================
-            size_match = re.search(r'(\d+(\.\d+)?)\s*(US|EU|UK)', text)
+            # Detecta formatos:
+            # 22.5 Japan (cm)
+            # 10 US
+            # 44 EU
+            size_match = re.search(
+                r"(\d+(\.\d+)?\s*(US|EU|UK|JP|CM|KOREA|ITALY|FR|IT|JAPAN|US MEN|US WOMEN|EUROPE|CM))",
+                text.upper()
+            )
 
             if not size_match:
                 continue
 
-            size = size_match.group(0)  # 🔥 MANTENER EXACTO
+            size = size_match.group(0).strip()
 
-            # evitar duplicados
             if size in sizes:
                 continue
 
             sizes.append(size)
 
             # =========================
-            # STOCK REAL
+            # 🔥 STOCK
             # =========================
-            if "última pieza" in text.lower():
+            lower = text.lower()
+
+            if "última pieza" in lower:
                 quantities.append(1)
-            elif "agotado" in text.lower():
+            elif "agotado" in lower:
                 quantities.append(0)
             else:
                 quantities.append(5)
 
+            # =========================
+            # 🔥 PRECIO POR VARIANTE
+            # =========================
+            price_match = re.search(r"\$[\s\d\.,]+", text)
+
+            if price_match:
+                price_clean = re.sub(r"[^\d]", "", price_match.group())
+                prices.append(int(price_clean))
+            else:
+                prices.append(0)
+
         # =========================
-        # VALIDACIÓN
+        # 3. VALIDACIÓN
         # =========================
         if sizes:
-            return sizes, quantities, []
+            return sizes, quantities, prices
 
     except Exception as e:
-        print("Error sizes dropdown:", e)
+        print("❌ Error obteniendo tallas:", e)
 
     # =========================
-    # FALLBACK API (MEJOR OPCIÓN)
+    # 🔥 FALLBACK API (FIABLE)
     # =========================
     try:
         url = driver.current_url
@@ -888,17 +937,23 @@ def get_sizes_advanced(driver):
 
         if data:
             parsed = parse_product_api(data)
-            return parsed["sizes"], parsed["quantities"], []
+            return parsed["sizes"], parsed["quantities"], [parsed["price"]] * len(parsed["sizes"])
 
-    except:
-        pass
+    except Exception as e:
+        print("❌ API fallback error:", e)
 
-    return ["M"], [5], []
-
+    # =========================
+    # 🔥 FALLBACK FINAL
+    # =========================
+    return [], [], []
 # =========================
 # DESCRIPTION
 # =========================
 def get_product_details_from_accordion(driver):
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
     details = {
         "features": [],
         "composition": [],
@@ -906,40 +961,48 @@ def get_product_details_from_accordion(driver):
     }
 
     try:
-        container = WebDriverWait(driver, 10).until(
+        # =========================
+        # 1. ENCONTRAR SECCIÓN REAL
+        # =========================
+        section = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "[data-testid='product-information-accordion']")
+                (By.XPATH, "//section[.//span[contains(text(),'Detalles del producto')]]")
             )
         )
 
-        # 🔥 FEATURES (li)
-        items = container.find_elements(By.XPATH, ".//ul//li")
-        for li in items:
-            text = li.text.strip()
-            if text:
-                details["features"].append(text)
+        # =========================
+        # 2. TEXTO PRINCIPAL
+        # =========================
+        paragraphs = section.find_elements(By.XPATH, ".//p")
 
-        # 🔥 COMPOSICIÓN
-        comp_blocks = container.find_elements(By.XPATH, ".//h4[contains(.,'Composición')]/following::p")
-
-        for p in comp_blocks:
-            text = p.text.strip()
-            if text and ":" in text:
-                details["composition"].append(text)
-            if len(details["composition"]) >= 5:
-                break
-
-        # 🔥 EXTRA INFO (hecho en, ids, etc)
-        paragraphs = container.find_elements(By.XPATH, ".//p")
         for p in paragraphs:
             text = p.text.strip()
-            if text and "ID" not in text:
-                details["extra"].append(text)
 
-    except Exception:
-        pass
+            if not text:
+                continue
+
+            if "ID" in text:
+                details["extra"].append(text)
+            else:
+                details["features"].append(text)
+
+        # =========================
+        # 3. COMPOSICIÓN
+        # =========================
+        comp = section.find_elements(By.XPATH, ".//h4[contains(text(),'Composición')]/following::p")
+
+        for c in comp:
+            text = c.text.strip()
+            if text:
+                details["composition"].append(text)
+
+        return details
+
+    except Exception as e:
+        print("❌ Details error:", e)
 
     return details
+
 
 def build_product_context(name, brand, details, colors, category):
     text = f"{name} {' '.join(details.get('features', []))}".lower()
@@ -988,30 +1051,30 @@ def get_brand_tone(brand):
 
 def generate_description_ollama_pro(name, brand, details, colors, category):
     import requests
+    import re
 
     ctx = build_product_context(name, brand, details, colors, category)
     tone = get_brand_tone(brand)
 
-    prompt = f"""
-- Inicia con una frase emocional o sensorial
-Eres experto en ecommerce de moda de alto nivel (estilo Farfetch).
+    try:
+        # =========================
+        # 🧩 1. GENERACIÓN BASE
+        # =========================
+        prompt_base = f"""
+Eres copywriter de moda.
 
-Genera una descripción de producto entre 180 y 260 caracteres.
+Escribe una descripción de producto (150–220 caracteres).
 
-⚠️ REGLAS:
+Reglas:
 - Español neutro
-- No inventar información
+- No inventar
 - No repetir marca más de una vez
-- No usar palabras genéricas como "producto"
-- Texto fluido, emocional y comercial
-- Incluir storytelling corto
 
-🎯 CONTEXTO:
+Contexto:
 Marca: {ctx["brand"]}
 Producto: {ctx["name"]}
 Categoría: {ctx["category"]}
 Segmento: {ctx["segment"]}
-Tono: {tone}
 
 Características:
 {", ".join(ctx["features"])}
@@ -1022,37 +1085,96 @@ Material:
 Color:
 {ctx["color"]}
 
-💡 OBJETIVO:
-- Si es luxury → enfatizar exclusividad, diseño, herencia
-- Si es sport → enfatizar rendimiento, comodidad, dinamismo
-- Si es casual → versatilidad y estilo diario
-
-✍️ RESPUESTA:
+Salida:
+Solo texto.
 """
 
-    try:
-        res = requests.post(
+        res1 = requests.post(
             "http://localhost:11434/api/generate",
             json={
-                "model": "mistral",  # puedes probar llama3 también
-                "prompt": prompt,
-                "stream": False
+                "model": "llama3",
+                "prompt": prompt_base,
+                "stream": False,
+                "options": {
+                    "temperature": 0.8,
+                    "top_p": 0.95
+                }
             },
-            timeout=15
+            timeout=20
         )
 
-        output = res.json().get("response", "").strip()
+        if res1.status_code != 200:
+            raise Exception(f"Ollama error {res1.status_code}")
 
-        # 🔥 limpieza básica
-        if len(output) < 80:
-            raise Exception("Respuesta débil")
+        draft = res1.json().get("response", "").strip()
 
-        return output[:300]
+        print("\n🧠 DRAFT:\n", draft)
 
-    except Exception:
-        return f"{name} de {brand}, diseño sofisticado que combina estilo y funcionalidad para destacar en cualquier ocasión."
-    
-    
+        if not draft:
+            raise Exception("Draft vacío")
+
+        # =========================
+        # ✨ 2. REESCRITURA EDITORIAL
+        # =========================
+        prompt_refine = f"""
+Actúa como editor senior de Farfetch.
+
+Reescribe el siguiente texto para que sea:
+- Más sofisticado
+- Más fluido
+- Con tono: {tone}
+- 180–240 caracteres
+
+Reglas:
+- NO agregar información nueva
+
+Texto:
+{draft}
+
+Salida:
+Solo texto final.
+"""
+
+        res2 = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": "llama3",
+                "prompt": prompt_refine,
+                "stream": False,
+                "options": {
+                    "temperature": 0.6,
+                    "top_p": 0.9
+                }
+            },
+            timeout=20
+        )
+
+        final = res2.json().get("response", "").strip()
+
+        print("\n✨ FINAL:\n", final)
+
+        # =========================
+        # 🔥 fallback inteligente (NO genérico)
+        # =========================
+        if not final:
+            final = draft
+
+        return re.sub(r"\s+", " ", final)[:260]
+
+    except Exception as e:
+        print("⚠️ Error Ollama:", e)
+
+        # ⚠️ fallback SOLO si TODO falla
+        base = f"{name} de {brand}".strip()
+
+        if ctx["segment"] == "luxury":
+            return f"{base} destaca por su ejecución precisa y materiales seleccionados, proyectando una estética refinada con carácter contemporáneo."
+
+        if ctx["segment"] == "sport":
+            return f"{base} ofrece una construcción ligera y dinámica, pensada para acompañar ritmos urbanos con energía y comodidad constante."
+
+        return f"{base} se integra con naturalidad en el día a día, aportando una presencia equilibrada y versátil."
+
 def build_details_array(details):
     result = []
 
