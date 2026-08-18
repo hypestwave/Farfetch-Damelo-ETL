@@ -6,3 +6,4 @@ openpyxl
 webdriver-manager
 requests
 openai
+playwright

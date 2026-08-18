@@ -1,1417 +1,799 @@
-import uuid
-import re
 import os
+import re
+import time
 import json
-import base64
+import uuid
 import random
+import unicodedata
 import requests
 import pandas as pd
-import cv2
-import numpy as np
-import onnxruntime as ort
-import time
-import threading
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from fastapi import FastAPI
-from pydantic import BaseModel
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
-from webdriver_manager.chrome import ChromeDriverManager
-from openai import OpenAI
-
-app = FastAPI()
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+from fastapi import Body, FastAPI, HTTPException
+from playwright.sync_api import sync_playwright
 
 # =========================
 # CONFIG
 # =========================
+
+USER_DATA_DIR = "./chrome_profile"
+
+HEADLESS = False
+
+MAX_PRODUCTS = 999
+
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/17 Safari/605.1.15",
 ]
 
+app = FastAPI(title="Farfetch Scraper Microservice")
 
 
-def get_headers():
-    return {"User-Agent": random.choice(USER_AGENTS)}
-
-if not os.path.exists("images"):
-    os.makedirs("images")
-
-# =========================
-# DRIVER ESTABLE
-# =========================
-def create_driver():
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.chrome.options import Options
-
-    options = Options()
-
-    # 🔥 MODO DEBUG (IMPORTANTE)
-    # Primero prueba SIN headless
-    options.add_argument("--start-maximized")
-
-    # ✅ estabilidad total
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-software-rasterizer")
-
-    # ✅ evita crash silencioso
-    options.add_argument("--remote-debugging-port=9222")
-
-    # ⚠️ MUY IMPORTANTE
-    options.binary_location = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-
-    service = Service(r"C:\chromedriver\chromedriver.exe")
-
-    driver = webdriver.Chrome(service=service, options=options)
-
-    driver.set_page_load_timeout(30)
-
-    return driver
+@app.get("/")
+def healthcheck():
+    return {"status": "ok"}
 
 
-# =========================
-# CACHE
-# =========================
-def load_cache():
-    if os.path.exists("cache.json"):
-        with open("cache.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+@app.post("/scrape")
+def scrape(urls: list[str] = Body(...)):
+    if not urls:
+        raise HTTPException(status_code=400, detail="Debes enviar al menos una URL")
 
-def save_cache(cache):
-    with open("cache.json", "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
-        
-def scrape_with_retry(url, retries=3):
-    for attempt in range(retries):
-        try:
-            result = scrape(url)
-
-            if "error" not in result:
-                return result
-
-        except Exception as e:
-            print(f"⚠️ Retry {attempt+1} error:", e)
-
-        time.sleep(random.uniform(2, 5))
+    file, results = scrape_urls(urls[:MAX_PRODUCTS])
 
     return {
-        "error": "max retries reached",
-        "url": url
+        "count": len(results),
+        "export": file,
+        "results": results,
     }
 
-lock = threading.Lock()
-
-def process_url(url, cache):
-    if url in cache:
-        print(f"⚡ Cache hit: {url}")
-        return cache[url]
-
-    print(f"🔎 Scraping: {url}")
-
-    result = scrape_with_retry(url)
-
-    with lock:
-        cache[url] = result
-        save_cache(cache)
-
-    return result
-
-def run_crawler(max_workers=5):
-    urls = list(set(load_urls_from_txt()))
-    cache = load_cache()
-
-    print(f"\n🚀 Total URLs: {len(urls)}")
-    print(f"⚡ Workers: {max_workers}\n")
-
-    results = []
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(process_url, url, cache): url
-            for url in urls
-        }
-
-        for future in as_completed(futures):
-            url = futures[future]
-
-            try:
-                result = future.result()
-
-                if "error" in result:
-                    print(f"❌ {url}")
-                else:
-                    print(f"✅ {result.get('name')}")
-
-                results.append(result)
-
-                # 🔥 guardado incremental excel
-                if len(results) % 3 == 0:
-                    save_excel(results)
-
-            except Exception as e:
-                print(f"💥 Thread error: {e}")
-
-    # =========================
-    # 💾 EXPORT FINAL
-    # =========================
-    file = save_excel(results)
-
-    print("\n📦 Export final:")
-    print(file)
-
-    return results
-
-
-
 # =========================
-# reimplemetation with direct api
+# FOLDERS
 # =========================
 
-MODEL_PATH = "shoe_classifier.onnx"
-session = None
+for folder in ["exports", "images"]:
+    if not os.path.exists(folder):
+        os.makedirs(folder)
 
-def get_onnx_session():
-    global session
+# =========================
+# HUMAN BEHAVIOR
+# =========================
 
-    if session is None:
-        if not os.path.exists(MODEL_PATH):
-            return None
-        session = ort.InferenceSession(MODEL_PATH)
-
-    return session
+def human_delay(a=1.5, b=4):
+    time.sleep(random.uniform(a, b))
 
 
-def preprocess(img_path):
-    img = cv2.imread(img_path)
-    img = cv2.resize(img, (224, 224))
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))
-    return np.expand_dims(img, axis=0)
+def random_mouse(page):
 
-def classify_shoe_onnx(image_path):
     try:
-        sess = get_onnx_session()
 
-        if sess is None:
-            return "Zapatillas"  # fallback
+        width = 1200
+        height = 900
 
-        input_tensor = preprocess(image_path)
+        for _ in range(random.randint(3, 8)):
 
-        outputs = sess.run(None, {"input": input_tensor})
-        probs = outputs[0][0]
+            x = random.randint(50, width)
+            y = random.randint(50, height)
 
-        idx = np.argmax(probs)
-        return SHOE_CATEGORIES[idx]
+            page.mouse.move(x, y)
 
-    except:
-        return "Zapatillas"
-
-def extract_product_id(url):
-    match = re.search(r'item-(\d+)', url)
-    return match.group(1) if match else None
-
-def load_urls_from_txt(filepath="products.txt"):
-    if not os.path.exists(filepath):
-        raise Exception(f"No existe {filepath}")
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f.readlines() if line.strip()]
-
-    return urls
-
-def run_from_txt():
-    urls = load_urls_from_txt()
-
-    print(f"🚀 Procesando {len(urls)} productos...\n")
-
-    results = []
-
-    for i, url in enumerate(urls, 1):
-        print(f"\n🔎 [{i}/{len(urls)}] {url}")
-
-        try:
-            product = scrape(url)
-
-            # 🔥 validar error
-            if "error" in product:
-                print(f"❌ Error: {product['error']}")
-            else:
-                print(f"✅ OK: {product.get('name')}")
-
-            results.append(product)
-
-        except Exception as e:
-            print(f"💥 Exception: {e}")
-            results.append({
-                "error": str(e),
-                "url": url
-            })
-
-        # 🔥 delay humano (anti-bloqueo)
-        time.sleep(random.uniform(2, 4))
-
-    # =========================
-    # 💾 EXPORT EXCEL
-    # =========================
-    file = save_excel(results)
-
-    print("\n📦 Export completo:")
-    print(file)
-
-    return results
-
-def fetch_product_api(url):
-    product_id = extract_product_id(url)
-
-    api_url = f"https://www.farfetch.com/api/product/{product_id}"
-
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json",
-        "Referer": url
-    }
-
-    r = requests.get(api_url, headers=headers)
-
-    if r.status_code != 200:
-        return None
-
-    data = r.json()
-
-    return data
-
-###new function
-def parse_product_api(data):
-    product = data.get("product", {})
-    name = product.get("shortDescription", "")
-    brand = product.get("brand", {}).get("name", "")
-
-    base_price = product.get("price", {}).get("value", 0)
-
-    images = [
-        img.get("url")
-        for img in product.get("images", [])
-    ]
-
-    sizes = []
-    quantities = []
-    prices = []
-
-    for variant in product.get("variants", []):
-        size = variant.get("size", {}).get("name")
-        stock = variant.get("stock", {}).get("quantity", 0)
-
-        # 🔥 PRECIO POR VARIANTE
-        variant_price = variant.get("price", {}).get("value")
-
-        if size:
-            sizes.append(size)
-            quantities.append(stock if stock else 0)
-
-            if variant_price:
-                prices.append(variant_price)
-
-    # =========================
-    # 🔥 LÓGICA CLAVE
-    # =========================
-    final_price = base_price
-
-    if prices:
-        max_variant_price = max(prices)
-
-        # 👉 si hay una talla más cara → usar ese precio
-        if max_variant_price > base_price:
-            final_price = max_variant_price
-
-    return {
-        "name": name,
-        "brand": brand,
-        "price": final_price,
-        "images": images,
-        "sizes": sizes,
-        "quantities": quantities
-    }
- 
-SHOE_CATEGORIES = [
-    "Tacones", "Botas", "Mocasines", "Mules",
-    "Zapatillas", "Sandalias", "Bailarinas",
-    "Chanclas", "Pantuflas",
-    
-    # 🔥 extras recomendadas
-    "Sneakers", "Loafers", "Derby",
-    "Oxford", "Slides", "Clogs",
-    "Espadrilles", "Ankle Boots",
-    "Knee Boots"
-]
-
-# =========================
-# categories of shoes
-# =========================
-VALID_SHOE_TYPES = [
-    "Tacones",
-    "Botas",
-    "Mocasines",
-    "Mules",
-    "Zapatillas",
-    "Sandalias",
-    "Bailarinas",
-    "Chanclas",
-    "Pantuflas",
-
-    # 🔥 extras recomendadas
-    "Sneakers",
-    "Loafers",
-    "Derbies",
-    "Oxfords",
-    "Slides",
-    "Espadrilles",
-    "Platform",
-    "Wedges",
-    "Ankle Boots",
-    "Knee-high Boots"
-]
-
-# =========================
-# OPENCV
-# =========================
-def get_product_type_final(name, details, images):
-    # 1. REGLAS y OLLAMA  (rápido y preciso)
-    result = get_product_type_hybrid(name, details)
-    if result and result != ["Shoes"]:
-        return result
-
-    # 3. ONNX (solo si existe)
-    USE_ONNX = False
-    if USE_ONNX and images:
-        vision = detect_product_type_from_image(images)
-        if vision:
-            return vision
-
-    return ["Zapatillas"]
-
-
-def classify_with_ollama(name, brand, details, visual_features):
-    try:
-        prompt = f"""
-Eres un clasificador experto en calzado.
-
-Clasifica el producto en UNA categoría válida.
-
-Categorías permitidas:
-{", ".join(VALID_SHOE_TYPES)}
-
-Producto: {name}
-Marca: {brand}
-
-Características:
-{", ".join(details.get("features", []))}
-
-Datos visuales:
-- edge_density: {visual_features.get("edge_density")}
-- aspect_ratio: {visual_features.get("aspect_ratio")}
-
-Reglas:
-- SOLO responde una categoría EXACTA de la lista
-- No inventar
-- Si dudas → Zapatillas
-
-Respuesta:
-"""
-
-        res = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "mistral",
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=10
-        )
-
-        output = res.json().get("response", "").strip()
-
-        # 🔥 normalización
-        for cat in VALID_SHOE_TYPES:
-            if cat.lower() in output.lower():
-                return [cat]
+            human_delay(0.1, 0.5)
 
     except:
         pass
 
-    return []
 
-def extract_visual_features(image_path):
+def manual_scroll(page):
+
     try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return {}
 
-        img = cv2.resize(img, (224, 224))
+        for _ in range(random.randint(4, 10)):
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            amount = random.randint(300, 1200)
 
-        edges = cv2.Canny(gray, 50, 150)
-        edge_density = edges.mean()
+            page.mouse.wheel(0, amount)
 
-        # proporción
-        h, w = gray.shape
-        aspect_ratio = w / h
-
-        return {
-            "edge_density": float(edge_density),
-            "aspect_ratio": float(aspect_ratio)
-        }
+            human_delay(0.5, 2)
 
     except:
-        return {}
+        pass
 
-def preprocess_image(image_path):
-    img = cv2.imread(image_path)
 
-    if img is None:
-        return None
+# =========================
+# PLAYWRIGHT
+# =========================
 
-    img = cv2.resize(img, (224, 224))
-    img = img.astype(np.float32) / 255.0
+def create_browser():
 
-    # formato modelo
-    img = np.transpose(img, (2, 0, 1))  # HWC → CHW
-    img = np.expand_dims(img, axis=0)
+    p = sync_playwright().start()
 
-    return img
+    browser = p.chromium.launch_persistent_context(
+        USER_DATA_DIR,
 
-def process_product(url):
-    data = fetch_product_api(url)
+        headless=HEADLESS,
 
-    if not data:
-        return {"error": "API failed"}
+        channel="chrome",
 
-    parsed = parse_product_api(data)
+        viewport={"width": 1440, "height": 960},
 
-    product_id = str(uuid.uuid4())[:8]
+        locale="es-CO",
 
-    # 🔥 descargar imagen principal
-    img_url = parsed["images"][0]
-    img_path = f"images/{product_id}.jpg"
-    download_image(img_url, img_path)
+        user_agent=random.choice(USER_AGENTS),
 
-    # 🔥 clasificación IA
-    category = classify_shoe_onnx(img_path)
-
-    # 🔥 descripción IA local
-    details = {
-        "features": [],
-        "composition": [],
-        "extra": []
-    }
-
-    description = generate_description_ollama_pro(
-        parsed["name"],
-        parsed["brand"],
-        details,
-        [],
-        category
+        args=[
+            "--disable-blink-features=AutomationControlled",
+            "--start-maximized",
+            "--disable-dev-shm-usage",
+            "--no-sandbox"
+        ]
     )
 
-    return {
-        "id": product_id,
-        "name": parsed["name"],
-        "trade": parsed["brand"],
-        "price": parsed["price"],
-        "images": parsed["images"],
-        "size": parsed["sizes"],
-        "quantity": parsed["quantities"],
-        "productType": [category],
-        "description": description,
-        "currency": "USD",
-        "available": True
-    }
-# import onnxruntime as ort
-# MODEL_PATH = "shoe_classifier.onnx"
-# session = ort.InferenceSession(MODEL_PATH)
+    page = browser.new_page()
+
+    page.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+
+        window.chrome = {
+            runtime: {}
+        };
+
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1,2,3,4,5]
+        });
+
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['es-CO', 'es', 'en']
+        });
+    """)
+
+    return p, browser, page
 
 
-def get_stealth_headers():
-    return {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
-        "Referer": "https://www.google.com/",
-        "Connection": "keep-alive"
-    }
+# =========================
+# HELPERS
+# =========================
 
-def human_delay():
-    time.sleep(random.uniform(2, 5))
+def load_urls(filepath="products.txt"):
 
-PROXIES = [
-    "http://user:pass@ip1:port",
-    "http://user:pass@ip2:port"
-]
+    if not os.path.exists(filepath):
+        raise Exception(f"No existe {filepath}")
 
-def get_proxy():
-    return {
-        "http": random.choice(PROXIES),
-        "https": random.choice(PROXIES)
-    }
+    with open(filepath, "r", encoding="utf-8") as f:
+        urls = [x.strip() for x in f.readlines() if x.strip()]
+
+    return urls[:MAX_PRODUCTS]
 
 
-MODEL_CLASSES = [
-    "Zapatillas",
-    "Tacones",
-    "Botas",
-    "Sandalias",
-    "Mocasines",
-    "Mules",
-    "Bailarinas",
-    "Chanclas",
-    "Pantuflas"
-]
+def extract_ref(url):
 
-VALID_CATEGORIES = [
-    "Tacones",
-    "Botas",
-    "Mocasines",
-    "Mules",
-    "Zapatillas",
-    "Sandalias",
-    "Bailarinas",
-    "Chanclas",
-    "Pantuflas",
-    # 🔥 extras recomendados
-    "Sneakers",
-    "Loafers",
-    "Derby",
-    "Oxford",
-    "Slides",
-    "Espadrilles"
-]
-def get_product_type_hybrid(name, details, images=None):
-    import re
+    match = re.search(r'item-(\d+)', url)
 
-    text = f"{name} {' '.join(details.get('features', []))}".lower()
-    
-    
-    
-    # =========================
-    # 1. REGLAS (FAST PATH)
-    # =========================
+    return match.group(1) if match else ""
+
+
+def extract_department(url):
+
+    match = re.search(r"/shopping/([^/]+)/", url)
+
+    return match.group(1).lower() if match else ""
+
+
+def normalize_text(text):
+
+    text = text or ""
+
+    return "".join(
+        c for c in unicodedata.normalize("NFD", text.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+
+def clean_price(price_text):
+
+    if not price_text:
+        return 0
+
+    cleaned = (
+        price_text
+        .replace("$", "")
+        .replace(".", "")
+        .replace(",", "")
+        .replace("COP", "")
+        .strip()
+    )
+
+    cleaned = re.sub(r"[^\d]", "", cleaned)
+
+    try:
+        return int(cleaned)
+    except:
+        return 0
+
+
+def extract_price(page):
+
+    selectors = [
+        "[data-component='PriceFinal']",
+        "[data-component='PriceOriginal']",
+        "p:has-text('$')",
+    ]
+
+    for selector in selectors:
+        try:
+            prices = page.locator(selector).all()
+            for price in prices:
+                try:
+                    text = price.inner_text().strip()
+                    value = clean_price(text)
+                    if value > 0:
+                        return value
+                except:
+                    pass
+        except:
+            pass
+
+    return 0
+
+
+def clean_brand(brand):
+
+    if not brand:
+        return "BRAND"
+
+    brand = re.sub(r"[^A-Za-z0-9]", "", brand.upper())
+
+    return brand[:20]
+
+
+def generate_sku(brand):
+
+    brand_clean = clean_brand(brand)
+
+    rand = uuid.uuid4().hex[:6]
+
+    return f"{brand_clean}-{rand}"
+
+
+def download_image(url, path):
+
+    try:
+
+        r = requests.get(
+            url,
+            timeout=20,
+            headers={
+                "User-Agent": random.choice(USER_AGENTS)
+            }
+        )
+
+        with open(path, "wb") as f:
+            f.write(r.content)
+
+        return True
+
+    except:
+        return False
+
+
+# =========================
+# DETAILS PARSER
+# =========================
+def extract_details(page):
+    details = []
+
+    try:
+        # Abrir acordeón "Detalles del producto" si no está expandido
+        accordions = page.locator("[data-component='AccordionButton']").all()
+        for acc in accordions:
+            try:
+                text = acc.inner_text().lower()
+                if "detalle" in text:
+                    expanded = acc.get_attribute("aria-expanded")
+                    if expanded != "true":
+                        acc.click()
+                        human_delay(1, 2)
+                    break
+            except:
+                pass
+
+        # =========================
+        # CARACTERÍSTICAS (ul._fdc1e5 > li)
+        # =========================
+        feature_items = page.locator("ul._fdc1e5 li[data-component='Body']").all()
+        for item in feature_items:
+            try:
+                text = item.inner_text().strip()
+                if text and len(text) > 1:
+                    details.append(text)
+            except:
+                pass
+
+        # =========================
+        # COMPOSICIÓN (busca el h4 "Composición" y toma el p siguiente)
+        # =========================
+        composition_blocks = page.locator(
+            "[data-component='AccordionPanel'] h4[data-component='BodyBold']"
+        ).all()
+        for h4 in composition_blocks:
+            try:
+                label = h4.inner_text().strip().lower()
+                if "composición" in label or "composicion" in label:
+                    # El párrafo de composición está en el mismo div padre
+                    parent = h4.locator("xpath=..") 
+                    comp_text = parent.locator("p[data-component='Body']").first.inner_text().strip()
+                    if comp_text:
+                        details.append(f"Composición: {comp_text}")
+                elif "medidas" in label:
+                    parent = h4.locator("xpath=..")
+                    medidas = parent.locator("p[data-component='Body']").all()
+                    for m in medidas:
+                        t = m.inner_text().strip()
+                        if t:
+                            details.append(t)
+            except:
+                pass
+
+    except Exception as e:
+        print("❌ details error:", e)
+
+    # Remover duplicados manteniendo orden
+    details = list(dict.fromkeys(details))
+    return details[:30]
+# =========================
+# DESCRIPTION LLM STYLE
+# =========================
+
+def build_description(name, brand, details):
+
+    text = ", ".join(details)
+
+    if len(text) > 500:
+        text = text[:500]
+
+    description = (
+        f"{name} de {brand} elaborado con detalles como "
+        f"{text}. Diseño contemporáneo y acabado premium "
+        f"para un look sofisticado y versátil."
+    )
+
+    return description[:1200]
+
+
+# =========================
+# CATEGORY
+# =========================
+
+def detect_category(name, details):
+
+    text = f"{name} {' '.join(details)}".lower()
+
     rules = {
         "Tacones": ["tacón", "heel", "pump"],
         "Botas": ["bota", "boot"],
         "Mocasines": ["mocasín", "loafer"],
         "Mules": ["mule"],
-        "Zapatillas": ["zapatilla", "sneaker", "tenis"],
-        "Sandalias": ["sandalia", "sandals"],
-        "Bailarinas": ["bailarina", "flat"],
-        "Chanclas": ["chancla", "flip flop"],
-        "Pantuflas": ["pantufla", "slipper"],
+        "Sandalias": ["sandalia"],
+        "Bailarinas": ["bailarina"],
+        "Chanclas": ["chancla"],
+        "Zapatillas": ["tenis", "sneaker", "zapatilla"],
     }
 
-    for category, keywords in rules.items():
-        if any(k in text for k in keywords):
-            return [category]
+    for cat, keys in rules.items():
 
-    # =========================
-    # 2. OLLAMA (IA LOCAL)
-    # =========================
-    try:
-        import requests
-        prompt = f"""
-Clasifica el tipo de calzado en UNA categoría válida.
+        if any(k in text for k in keys):
 
-Categorías:
-Tacones, Botas, Mocasines, Mules, Zapatillas, Sandalias, Bailarinas, Chanclas, Pantuflas, Sneakers, Loafers, Derby, Oxford, Slides, Espadrilles
+            return cat
 
-Producto: {name}
-Características: {', '.join(details.get('features', []))}
+    return "Zapatillas"
 
-Responde SOLO con la categoría exacta.
-"""
 
-        res = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt,
-                "stream": False
-            },
-            timeout=5
-        )
-
-        if res.status_code == 200:
-            response = res.json().get("response", "").strip()
-
-            for cat in VALID_CATEGORIES:
-                if cat.lower() in response.lower():
-                    return [cat]
-
-    except Exception:
-        pass
-
-    # =========================
-    # 3. FALLBACK INTELIGENTE
-    # =========================
-    if "suela" in text:
-        return ["Zapatillas"]
-
-    if "piel" in text:
-        return ["Mocasines"]
-
-    return ["Shoes"]
-
-def detect_product_type_from_image(image_paths):
-    if not image_paths:
-        return []
-
-    try:
-        img = preprocess_image(image_paths[0].lstrip("/"))
-        if img is None:
-            return []
-
-        sess = get_onnx_session()
-        if not sess:
-            return []
-
-        inputs = {sess.get_inputs()[0].name: img}
-        outputs = sess.run(None, inputs)
-
-        probs = outputs[0][0]
-        idx = int(np.argmax(probs))
-
-        category = MODEL_CLASSES[idx]
-
-        return [category]
-
-    except Exception:
-        return []
-    
-def detect_product_type_fallback(name, details):
-    text = f"{name} {' '.join(details.get('features', []))}".lower()
-
-    if "tacón" in text:
-        return ["Tacones"]
-    if "bota" in text:
-        return ["Botas"]
-    if "sandalia" in text:
-        return ["Sandalias"]
-    if "zapat" in text or "sneaker" in text:
-        return ["Zapatillas"]
-    if "mocas" in text:
-        return ["Mocasines"]
-
-    return ["Zapatillas"]
-
-# =========================
-# SCRAPER HELPERS
-# =========================
-
-def get_price(driver):
-    try:
-        # ✅ SELECTOR EXACTO FARFETCH
-        el = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "[data-component='Price']")
-            )
-        )
-
-        price_text = el.text.strip()
-
-        # 🔥 LIMPIEZA FORMATO LATAM
-        # "$ 3.551.309" → "3551309"
-        price_clean = (
-            price_text
-            .replace("$", "")
-            .replace("COP", "")
-            .replace(".", "")
-            .replace(",", "")
-            .strip()
-        )
-
-        return float(price_clean)
-
-    except Exception:
-        pass
-
-    # 🔥 FALLBACK 1 — JSON-LD
-    try:
-        html = driver.page_source
-        match = re.search(r'"price"\s*:\s*"?([0-9]+)"?', html)
-        if match:
-            return float(match.group(1))
-    except:
-        pass
-
-    # 🔥 FALLBACK 2 — cualquier texto con $
-    try:
-        el = driver.find_element(By.XPATH, "//p[contains(text(),'$')]")
-        text = el.text
-        price_clean = re.sub(r"[^\d]", "", text)
-        return float(price_clean)
-    except:
-        pass
-
-    return 0
-  
-def get_brand(driver):
-    selectors = [
-        "//a[@data-ffref='pp_infobrd']",
-        "//a[contains(@href,'/shopping/') and contains(@href,'/items.aspx')]"
-    ]
-
-    for sel in selectors:
-        try:
-            el = driver.find_element(By.XPATH, sel)
-            if el.text.strip():
-                from html import unescape
-                return unescape(el.text.strip())
-        except:
-            continue
-
-    return "Unknown"
-
-def download_image(url, path):
-    try:
-        r = requests.get(url, headers=get_headers(), timeout=10)
-        with open(path, "wb") as f:
-            f.write(r.content)
-        return True
-    except:
-        return False
-
-def get_images(driver, product_id):
-    imgs = driver.find_elements(By.XPATH, "//img")
-    paths = []
-    used = set()
-
-    for i, img in enumerate(imgs):
-        src = img.get_attribute("src") or ""
-        if "jpg" in src and src not in used:
-            used.add(src)
-            path = f"images/{product_id}_{i}.jpg"
-            if download_image(src, path):
-                paths.append("/" + path)
-        if len(paths) >= 4:
-            break
-
-    return paths
-
-def get_product_name(driver):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-
-    # 🔥 SELECTOR EXACTO FARFETCH
-    try:
-        el = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "[data-testid='product-short-description']")
-            )
-        )
-        text = el.text.strip()
-        if text:
-            return text
-    except Exception:
-        pass
-
-    # 🔥 FALLBACK 1 — h1 (algunos productos lo usan)
-    try:
-        h1 = driver.find_elements(By.TAG_NAME, "h1")
-        for el in h1:
-            text = el.text.strip()
-            if len(text) > 5:
-                return text
-    except:
-        pass
-
-    # 🔥 FALLBACK 2 — JSON-LD
-    try:
-        import re, json
-        html = driver.page_source
-        match = re.search(r'"name"\s*:\s*"([^"]+)"', html)
-        if match:
-            return match.group(1)
-    except:
-        pass
-
-    return "Unknown Product"
-
-# =========================
-# OPENAI
-# =========================
-def analyze_images(image_paths, name, brand):
-    if not OPENAI_API_KEY or not image_paths:
-        return {}
-
-    imgs = []
-    for path in image_paths[:2]:
-        with open(path.lstrip("/"), "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        imgs.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
-        })
-
-    prompt = f"""
-Producto: {name}
-Marca: {brand}
-
-Devuelve JSON con:
-description, productType, colors
-"""
-
-    try:
-        res = openai_client.responses.create(
-            model="gpt-4o",
-            input=[{
-                "role": "user",
-                "content": imgs + [{"type": "text", "text": prompt}]
-            }]
-        )
-        raw = res.output[0].content[0].text
-        return json.loads(raw)
-    except:
-        return {}
-
-def parse_colors(colors_str):
-    result = []
-
-    if not colors_str:
-        return result
-
-    parts = colors_str.split("|")
-
-    for p in parts:
-        try:
-            name, hexcode = p.split(":")
-            result.append({
-                "name": name.strip(),
-                "hex": hexcode.strip()
-            })
-        except:
-            continue
-
-    return result
- 
-def extract_ref(url):
-    match = re.search(r'item-(\d+)', url)
-    return match.group(1) if match else ""
-# =========================
-# SCRAPE
-# =========================
-def scrape(url):
-    driver = None
-    try:
-        driver = create_driver()
-        driver.get(url)
-
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-
-        name = get_product_name(driver)
-        brand = get_brand(driver)
-        price = get_price(driver)
-
-        product_id = str(uuid.uuid4())[:8]
-        images = get_images(driver, product_id)
-
-        sizes, quantities, size_map = get_sizes_advanced(driver)
-        
-        accordion_data = get_product_details_from_accordion(driver)
-        details = build_details_array(accordion_data)
-        ai = analyze_images(images, name, brand)
-        colors = parse_colors(ai.get("colors", "")) or []
-        product_type = get_product_type_final(
-            name,
-            accordion_data,
-            images
-        )
-        description = generate_description_ollama_pro(
-            name,
-            brand,
-            accordion_data,
-            colors,
-            product_type[0] if product_type else "Shoes"
-        )
-        return {
-            "id": product_id,
-            "name": name,
-            "size": sizes,
-            "price": price,
-            "quantity": quantities,
-            "description": description,
-            "image": images[0] if images else "",
-            "images": images,
-            "colors": colors,
-            "productType": product_type,
-            "trade": brand,
-            "sku": f"{brand}-{product_id}",
-            "source": url,
-            "externalRef": extract_ref(url),
-            "currency": "COP",
-            "department": "Women",
-            "category": product_type[0] if product_type else "Shoes",
-            "details": details,
-            "ownerId": "9001",
-            "available": True,
-            "archived": False,
-        }
-
-    except Exception as e:
-        return {"error": str(e), "url": url}
-
-    finally:
-        if driver:
-            driver.quit()
 # =========================
 # SIZES
 # =========================
-def get_sizes_advanced(driver):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    import time
-    import re
+
+def extract_sizes(page):
+
+    sizes = []
+
+    try:
+
+        buttons = page.locator("button").all()
+
+        for btn in buttons:
+
+            try:
+
+                text = btn.inner_text().strip()
+
+                if re.search(r"\d+(\.\d+)?\s?(EU|US|UK|CM)", text.upper()):
+
+                    sizes.append(text)
+
+            except:
+                pass
+
+    except:
+        pass
+
+    return list(dict.fromkeys(sizes))
+
+
+def extract_size_inventory(page):
 
     sizes = []
     quantities = []
-    prices = []
 
     try:
-        # =========================
-        # 1. ABRIR SELECTOR
-        # =========================
-        selector = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, "[data-component='SizeSelectorLabel']")
-            )
-        )
+        selector = page.locator("[data-testid='ScaledSizeSelector'] [role='combobox']").first
+        if selector.count() > 0:
+            selector.click()
+            human_delay(0.5, 1)
 
-        driver.execute_script("arguments[0].click();", selector)
+        options = page.locator(
+            "li[role='option'][data-component='SizeSelectorOption']"
+        ).all()
 
-        # 🔥 esperar render REAL (no sleep fijo)
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_all_elements_located(
-                (By.XPATH, "//li | //div[@role='option']")
-            )
-        )
+        for option in options:
+            try:
+                option_text = option.inner_text().strip()
 
-        time.sleep(1)  # micro delay para React hydration
+                size_text = ""
+                try:
+                    size_text = option.locator(
+                        "[data-component='SizeSelectorOptionSize']"
+                    ).first.inner_text().strip()
+                except:
+                    size_text = option_text
 
-        # =========================
-        # 2. CAPTURAR OPCIONES
-        # =========================
-        options = driver.find_elements(
-            By.XPATH,
-            "//li | //div[@role='option']"
-        )
+                match = re.search(r"\d+(?:\.\d+)?", size_text)
+                if not match:
+                    continue
 
-        for opt in options:
-            text = opt.text.strip()
+                size = match.group(0)
+                if size in sizes:
+                    continue
 
-            if not text:
-                continue
+                sizes.append(size)
+                normalized = normalize_text(option_text)
+                quantities.append(1 if "ultima pieza" in normalized else 2)
 
-            # =========================
-            # 🔥 EXTRAER SIZE COMPLETA (SIN NORMALIZAR)
-            # =========================
-            # Detecta formatos:
-            # 22.5 Japan (cm)
-            # 10 US
-            # 44 EU
-            size_match = re.search(
-                r"(\d+(\.\d+)?\s*(US|EU|UK|JP|CM|KOREA|ITALY|FR|IT|JAPAN|US MEN|US WOMEN|EUROPE|CM))",
-                text.upper()
-            )
+            except:
+                pass
 
-            if not size_match:
-                continue
+    except:
+        pass
 
-            size = size_match.group(0).strip()
+    if not sizes:
+        sizes = extract_sizes(page)
+        quantities = [2] * len(sizes)
 
-            if size in sizes:
-                continue
+    return sizes, quantities
 
-            sizes.append(size)
 
-            # =========================
-            # 🔥 STOCK
-            # =========================
-            lower = text.lower()
-
-            if "última pieza" in lower:
-                quantities.append(1)
-            elif "agotado" in lower:
-                quantities.append(0)
-            else:
-                quantities.append(5)
-
-            # =========================
-            # 🔥 PRECIO POR VARIANTE
-            # =========================
-            price_match = re.search(r"\$[\s\d\.,]+", text)
-
-            if price_match:
-                price_clean = re.sub(r"[^\d]", "", price_match.group())
-                prices.append(int(price_clean))
-            else:
-                prices.append(0)
-
-        # =========================
-        # 3. VALIDACIÓN
-        # =========================
-        if sizes:
-            return sizes, quantities, prices
-
-    except Exception as e:
-        print("❌ Error obteniendo tallas:", e)
-
-    # =========================
-    # 🔥 FALLBACK API (FIABLE)
-    # =========================
-    try:
-        url = driver.current_url
-        data = fetch_product_api(url)
-
-        if data:
-            parsed = parse_product_api(data)
-            return parsed["sizes"], parsed["quantities"], [parsed["price"]] * len(parsed["sizes"])
-
-    except Exception as e:
-        print("❌ API fallback error:", e)
-
-    # =========================
-    # 🔥 FALLBACK FINAL
-    # =========================
-    return [], [], []
 # =========================
-# DESCRIPTION
+# IMAGES
 # =========================
-def get_product_details_from_accordion(driver):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
 
-    details = {
-        "features": [],
-        "composition": [],
-        "extra": []
-    }
+def extract_images(page, sku):
+
+    images = []
+
+    used = set()
+
+    image_index = 1
+
+    def save_large_image(src):
+        nonlocal image_index
+
+        if not src:
+            return
+
+        key = src.split("?")[0]
+
+        if key in used:
+            return
+
+        used.add(key)
+
+        filename = f"{sku}-{image_index}.jpg"
+
+        path = f"images/{filename}"
+
+        ok = download_image(src, path)
+
+        if ok:
+            images.append(path)
+            image_index += 1
 
     try:
-        # =========================
-        # 1. ENCONTRAR SECCIÓN REAL
-        # =========================
-        section = WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//section[.//span[contains(text(),'Detalles del producto')]]")
-            )
+
+        selected_image = page.locator("#selected-image img").first
+
+        thumbnails = page.locator(
+            "button[data-carousel-item-button='true'][aria-label='Abrir imagen']"
         )
 
-        # =========================
-        # 2. TEXTO PRINCIPAL
-        # =========================
-        paragraphs = section.find_elements(By.XPATH, ".//p")
+        count = thumbnails.count()
 
-        for p in paragraphs:
-            text = p.text.strip()
+        for i in range(min(count, 5)):
 
-            if not text:
-                continue
+            try:
 
-            if "ID" in text:
-                details["extra"].append(text)
-            else:
-                details["features"].append(text)
+                thumbnail = thumbnails.nth(i)
 
-        # =========================
-        # 3. COMPOSICIÓN
-        # =========================
-        comp = section.find_elements(By.XPATH, ".//h4[contains(text(),'Composición')]/following::p")
+                thumbnail.scroll_into_view_if_needed(timeout=5000)
 
-        for c in comp:
-            text = c.text.strip()
-            if text:
-                details["composition"].append(text)
+                previous_src = ""
 
-        return details
+                try:
+                    previous_src = selected_image.get_attribute("src") or ""
+                except:
+                    pass
 
-    except Exception as e:
-        print("❌ Details error:", e)
+                thumbnail.click(force=True, timeout=10000)
 
-    return details
+                page.wait_for_selector("#selected-image img", timeout=10000)
 
+                try:
+                    page.wait_for_function(
+                        """previous => {
+                            const img = document.querySelector('#selected-image img');
+                            return img && img.src && img.src !== previous;
+                        }""",
+                        previous_src,
+                        timeout=5000
+                    )
+                except:
+                    pass
 
-def build_product_context(name, brand, details, colors, category):
-    text = f"{name} {' '.join(details.get('features', []))}".lower()
+                src = selected_image.get_attribute("src") or ""
 
-    # 🎯 DETECCIÓN DE SEGMENTO
-    segment = "casual"
+                if "_300." in src:
+                    src = src.replace("_300.", "_1000.")
 
-    if any(k in text for k in ["running", "sport", "trainer", "tenis", "zapat"]):
-        segment = "sport"
-    elif any(k in text for k in ["cuero", "leather", "italy", "hecho en"]):
-        segment = "luxury"
+                save_large_image(src)
 
-    # 🎨 COLOR
-    color = ""
-    if colors:
-        color = colors[0].get("name", "")
+                if len(images) >= 5:
+                    break
 
-    # 🧵 MATERIAL
-    material = ""
-    if details.get("composition"):
-        material = details["composition"][0]
+                human_delay(0.4, 1)
 
-    return {
-        "name": name,
-        "brand": brand,
-        "category": category,
-        "features": details.get("features", [])[:4],
-        "material": material,
-        "color": color,
-        "segment": segment
-    }
-    
-def get_brand_tone(brand):
-    brand = brand.lower()
+            except:
+                pass
 
-    if any(b in brand for b in ["gucci", "prada", "balenciaga", "valentino"]):
-        return "lujo, sofisticado, exclusivo, editorial"
-    
-    if any(b in brand for b in ["nike", "adidas", "puma", "reebok"]):
-        return "dinámico, deportivo, energético"
-    
-    if any(b in brand for b in ["zara", "h&m", "mango"]):
-        return "moderno, accesible, tendencia"
-    
-    return "premium, elegante, contemporáneo"
+    except:
+        pass
 
-def generate_description_ollama_pro(name, brand, details, colors, category):
-    import requests
-    import re
-
-    ctx = build_product_context(name, brand, details, colors, category)
-    tone = get_brand_tone(brand)
+    if images:
+        return images
 
     try:
-        # =========================
-        # 🧩 1. GENERACIÓN BASE
-        # =========================
-        prompt_base = f"""
-Eres copywriter de moda.
 
-Escribe una descripción de producto (150–220 caracteres).
+        img_elements = page.locator("img").all()
 
-Reglas:
-- Español neutro
-- No inventar
-- No repetir marca más de una vez
+        for img in img_elements:
 
-Contexto:
-Marca: {ctx["brand"]}
-Producto: {ctx["name"]}
-Categoría: {ctx["category"]}
-Segmento: {ctx["segment"]}
+            try:
 
-Características:
-{", ".join(ctx["features"])}
+                src = img.get_attribute("src") or ""
 
-Material:
-{ctx["material"]}
+                if (
+                    "farfetch" in src.lower()
+                    and (
+                        ".jpg" in src.lower()
+                        or ".jpeg" in src.lower()
+                    )
+                ):
 
-Color:
-{ctx["color"]}
+                    if "_300." in src:
+                        src = src.replace("_300.", "_1000.")
 
-Salida:
-Solo texto.
-"""
+                    save_large_image(src)
 
-        res1 = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt_base,
-                "stream": False,
-                "options": {
-                    "temperature": 0.8,
-                    "top_p": 0.95
-                }
-            },
-            timeout=20
+                if len(images) >= 5:
+                    break
+
+            except:
+                pass
+
+    except:
+        pass
+
+    return images
+
+
+# =========================
+# SCRAPER
+# =========================
+
+def scrape_product(page, url):
+
+    print(f"\n🔎 Opening:")
+    print(url)
+
+    try:
+
+        page.goto(
+            url,
+            wait_until="domcontentloaded",
+            timeout=90000
         )
 
-        if res1.status_code != 200:
-            raise Exception(f"Ollama error {res1.status_code}")
+        human_delay(4, 8)
 
-        draft = res1.json().get("response", "").strip()
+        random_mouse(page)
 
-        print("\n🧠 DRAFT:\n", draft)
+        manual_scroll(page)
 
-        if not draft:
-            raise Exception("Draft vacío")
-
-        # =========================
-        # ✨ 2. REESCRITURA EDITORIAL
-        # =========================
-        prompt_refine = f"""
-Actúa como editor senior de Farfetch.
-
-Reescribe el siguiente texto para que sea:
-- Más sofisticado
-- Más fluido
-- Con tono: {tone}
-- 180–240 caracteres
-
-Reglas:
-- NO agregar información nueva
-
-Texto:
-{draft}
-
-Salida:
-Solo texto final.
-"""
-
-        res2 = requests.post(
-            "http://localhost:11434/api/generate",
-            json={
-                "model": "llama3",
-                "prompt": prompt_refine,
-                "stream": False,
-                "options": {
-                    "temperature": 0.6,
-                    "top_p": 0.9
-                }
-            },
-            timeout=20
+        page.wait_for_selector(
+            "[data-testid='product-short-description']",
+            timeout=30000
         )
 
-        final = res2.json().get("response", "").strip()
-
-        print("\n✨ FINAL:\n", final)
+        human_delay(1, 2)
 
         # =========================
-        # 🔥 fallback inteligente (NO genérico)
+        # NAME
         # =========================
-        if not final:
-            final = draft
 
-        return re.sub(r"\s+", " ", final)[:260]
+        name = ""
+
+        try:
+            name = page.locator(
+                "[data-testid='product-short-description']"
+            ).first.inner_text().strip()
+        except:
+            pass
+
+        # =========================
+        # BRAND
+        # =========================
+
+        brand = "Unknown"
+
+        try:
+            brand = page.locator(
+                "[data-ffref='pp_infobrd']"
+            ).first.inner_text().strip()
+        except:
+            pass
+
+        # =========================
+        # PRICE
+        # =========================
+
+        price = 0
+
+        try:
+
+            price = extract_price(page)
+
+        except:
+            pass
+
+        # =========================
+        # SKU
+        # =========================
+
+        sku = generate_sku(brand)
+
+        # =========================
+        # IMAGES
+        # =========================
+
+        images = extract_images(page, sku)
+
+        # =========================
+        # DETAILS
+        # =========================
+
+        details = extract_details(page)
+
+        # =========================
+        # DESCRIPTION
+        # =========================
+
+        description = build_description(
+            name,
+            brand,
+            details
+        )
+
+        # =========================
+        # SIZES
+        # =========================
+
+        sizes, quantities = extract_size_inventory(page)
+
+        # =========================
+        # CATEGORY
+        # =========================
+
+        category = detect_category(
+            name,
+            details
+        )
+
+        # =========================
+        # RESULT
+        # =========================
+
+        result = {
+
+            "id": uuid.uuid4().hex[:8],
+
+            "sku": sku,
+
+            "externalRef": extract_ref(url),
+
+            "ownerId": "9001",
+
+            "name": name,
+
+            "trade": brand,
+
+            "department": extract_department(url),
+
+            "price": price,
+
+            "currency": "COP",
+
+            "available": True,
+
+            "description": description,
+
+            "image": images[0] if images else "",
+
+            "images": json.dumps(images, ensure_ascii=False),
+
+            "productType": json.dumps([category], ensure_ascii=False),
+
+            "category": category,
+
+            "size": json.dumps(sizes, ensure_ascii=False),
+
+            "quantity": json.dumps(quantities),
+
+            "details": json.dumps(details, ensure_ascii=False),
+
+            "source": url,
+
+            "archived": False,
+
+            "archivedAt": "",
+
+            "archivedBy": ""
+
+        }
+
+        print("✅ OK:")
+        print(name)
+
+        return result
 
     except Exception as e:
-        print("⚠️ Error Ollama:", e)
 
-        # ⚠️ fallback SOLO si TODO falla
-        base = f"{name} de {brand}".strip()
+        print("❌ ERROR:")
+        print(e)
 
-        if ctx["segment"] == "luxury":
-            return f"{base} destaca por su ejecución precisa y materiales seleccionados, proyectando una estética refinada con carácter contemporáneo."
-
-        if ctx["segment"] == "sport":
-            return f"{base} ofrece una construcción ligera y dinámica, pensada para acompañar ritmos urbanos con energía y comodidad constante."
-
-        return f"{base} se integra con naturalidad en el día a día, aportando una presencia equilibrada y versátil."
-
-def build_details_array(details):
-    result = []
-
-    # 🔥 FEATURES
-    for f in details.get("features", []):
-        result.append(f"Característica: {f}")
-
-    # 🔥 COMPOSICIÓN
-    for c in details.get("composition", []):
-        result.append(c)
-
-    # 🔥 EXTRA
-    for e in details.get("extra", []):
-        if "Hecho en" in e:
-            result.append(e)
-
-    return result[:10]  # límite limpio
-
-def normalize_record(record):
-    fields = [
-        "id",
-        "sku",
-        "externalRef",
-        "ownerId",
-        "name",
-        "trade",
-        "department",
-        "price",
-        "currency",
-        "available",
-        "description",
-        "image",
-        "images",
-        "productType",
-        "size",
-        "quantity",
-        "colors",
-        "details",
-        "source",
-        "archived",
-        "archivedAt",
-        "archivedBy"
-    ]
-
-    normalized = {}
-
-    for field in fields:
-        normalized[field] = serialize_for_etl(record.get(field))
-
-    return normalized
-
-def serialize_for_etl(value):
-    if isinstance(value, (list, dict)):
-        return json.dumps(value, ensure_ascii=False)
-    if isinstance(value, bool):
-        return str(value).lower()
-    return value
+        return {
+            "error": str(e),
+            "url": url
+        }
 
 
 # =========================
-# 
+# SAVE EXCEL
 # =========================
 
-# =========================
-# EXCEL SEGURO
-# =========================
-def save_excel(records, filepath=None):
-    import pandas as pd
-    import time
-    import os
+def save_excel(records):
 
-    # 🔥 carpeta segura
-    folder = "exports"
-    if not os.path.exists(folder):
-        os.makedirs(folder)
+    filename = f"exports/products_{int(time.time())}.xlsx"
 
-    # 🔥 nombre dinámico (evita PermissionError)
-    if not filepath:
-        filepath = os.path.join(folder, f"products_{int(time.time())}.xlsx")
+    df = pd.DataFrame(records)
 
-    # 🔥 normalizar
-    normalized = [normalize_record(r) for r in records]
-
-    df = pd.DataFrame(normalized)
-
-    # 🔥 ORDEN EXACTO (MODELO COMPLETO)
     columns = [
         "id",
         "sku",
@@ -1429,7 +811,6 @@ def save_excel(records, filepath=None):
         "productType",
         "size",
         "quantity",
-        "colors",
         "details",
         "source",
         "archived",
@@ -1437,40 +818,99 @@ def save_excel(records, filepath=None):
         "archivedBy"
     ]
 
-    # asegurar columnas
     for col in columns:
+
         if col not in df.columns:
             df[col] = ""
 
     df = df[columns]
 
-    df.to_excel(filepath, index=False)
+    df.to_excel(filename, index=False)
 
-    return filepath
-# REQUEST
-# =========================
-class ScrapeRequest(BaseModel):
-    urls: list[str]
+    return filename
+
 
 # =========================
-# ENDPOINT
+# MAIN
 # =========================
-@app.post("/scrape")
-def scrape_api(req: ScrapeRequest):
+
+def scrape_urls(urls):
+
+    print(f"\n🚀 URLs: {len(urls)}")
+
+    p, browser, page = create_browser()
+
     results = []
 
-    for url in req.urls:
-        results.append(scrape(url))
+    try:
 
-    file = save_excel(results)
-    save_excel(results, filepath="exports/partial.xlsx")
+        # =========================
+        # LOGIN MANUAL
+        # =========================
 
-    return {
-        "status": "ok",
-        "products": len(results),
-        "file": file,
-        "data": results
-    }
-    
-   
-if __name__ == "__main__": run_crawler(max_workers=5)
+        print("\n🌐 Opening homepage...")
+
+        page.goto(
+            "https://www.farfetch.com/",
+            wait_until="domcontentloaded"
+        )
+
+        print("\n⏳ Tienes 10 segundos para:")
+        print("- login")
+        print("- captcha")
+        print("- cookies")
+
+        time.sleep(10)
+
+        # =========================
+        # SCRAPE
+        # =========================
+
+        for i, url in enumerate(urls, 1):
+
+            print("\n=========================")
+            print(f"[{i}/{len(urls)}]")
+            print("=========================")
+
+            result = scrape_product(page, url)
+
+            results.append(result)
+
+            # save incremental
+            if len(results) % 3 == 0:
+
+                file = save_excel(results)
+
+                print("\n💾 Partial export:")
+                print(file)
+
+            human_delay(5, 12)
+
+        # =========================
+        # FINAL EXPORT
+        # =========================
+
+        file = save_excel(results)
+
+        print("\n📦 FINAL EXPORT:")
+        print(file)
+
+        return file, results
+
+    finally:
+
+        browser.close()
+
+        p.stop()
+
+
+def run():
+
+    urls = load_urls()
+
+    scrape_urls(urls)
+
+
+if __name__ == "__main__":
+
+    run()

@@ -1,0 +1,6 @@
+2026/08/18-00:48:35.422 dc Reusing MANIFEST C:\Users\daw\Desktop\Farfetch-Damelo-ETL\chrome_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/08/18-00:48:35.438 dc Recovering log #9
+2026/08/18-00:48:35.444 dc Reusing old log C:\Users\daw\Desktop\Farfetch-Damelo-ETL\chrome_profile\Default\Local Storage\leveldb/000009.log 
+2026/08/18-00:49:22.603 31a4 Level-0 table #12: started
+2026/08/18-00:49:22.610 31a4 Level-0 table #12: 14895 bytes OK
+2026/08/18-00:49:22.612 31a4 Delete type=0 #9
