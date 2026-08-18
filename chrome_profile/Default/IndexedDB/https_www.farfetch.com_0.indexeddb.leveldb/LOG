@@ -1,14 +1,13 @@
-2026/08/18-00:54:33.866 14c Reusing MANIFEST C:\Users\daw\Desktop\Farfetch-Damelo-ETL\chrome_profile\Default\IndexedDB\https_www.farfetch.com_0.indexeddb.leveldb/MANIFEST-000001
-2026/08/18-00:54:33.867 14c Recovering log #142
-2026/08/18-00:54:33.868 14c Reusing old log C:\Users\daw\Desktop\Farfetch-Damelo-ETL\chrome_profile\Default\IndexedDB\https_www.farfetch.com_0.indexeddb.leveldb/000142.log 
-2026/08/18-00:54:33.868 14c Delete type=2 #140
-2026/08/18-00:54:34.012 11a0 Level-0 table #147: started
-2026/08/18-00:54:34.016 11a0 Level-0 table #147: 1366 bytes OK
-2026/08/18-00:54:34.019 11a0 Delete type=0 #142
-2026/08/18-00:54:34.020 11a0 Manual compaction at level-0 from '\x00(\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00)\x00\x00\x00' @ 0 : 0; will stop at '\x00(\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 5242 : 1
-2026/08/18-00:54:34.020 11a0 Compacting 1@0 + 1@1 files
-2026/08/18-00:54:34.025 11a0 Generated table #148@0: 199 keys, 3711 bytes
-2026/08/18-00:54:34.025 11a0 Compacted 1@0 + 1@1 files => 3711 bytes
-2026/08/18-00:54:34.026 11a0 compacted to: files[ 0 1 1 0 0 0 0 ]
-2026/08/18-00:54:34.027 11a0 Delete type=2 #147
-2026/08/18-00:54:34.028 11a0 Manual compaction at level-0 from '\x00(\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 5242 : 1 .. '\x00)\x00\x00\x00' @ 0 : 0; will stop at (end)
+2026/08/18-02:25:15.636 fc8 Reusing MANIFEST C:\Users\daw\Desktop\Farfetch-Damelo-ETL\chrome_profile\Default\IndexedDB\https_www.farfetch.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/08/18-02:25:15.637 fc8 Recovering log #150
+2026/08/18-02:25:15.638 fc8 Reusing old log C:\Users\daw\Desktop\Farfetch-Damelo-ETL\chrome_profile\Default\IndexedDB\https_www.farfetch.com_0.indexeddb.leveldb/000150.log 
+2026/08/18-02:25:15.963 307c Level-0 table #155: started
+2026/08/18-02:25:15.965 307c Level-0 table #155: 2981 bytes OK
+2026/08/18-02:25:15.967 307c Delete type=0 #150
+2026/08/18-02:25:15.968 1c6c Manual compaction at level-0 from '\x00,\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00-\x00\x00\x00' @ 0 : 0; will stop at '\x00,\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 5563 : 1
+2026/08/18-02:25:15.968 1c6c Compacting 1@0 + 1@1 files
+2026/08/18-02:25:15.970 1c6c Generated table #156@0: 205 keys, 3832 bytes
+2026/08/18-02:25:15.971 1c6c Compacted 1@0 + 1@1 files => 3832 bytes
+2026/08/18-02:25:15.971 1c6c compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/08/18-02:25:15.972 1c6c Delete type=2 #155
+2026/08/18-02:25:15.973 1c6c Manual compaction at level-0 from '\x00,\x01\x03\x03\x00\x00\x00\x00\x00\x00\xf0?' @ 5563 : 1 .. '\x00-\x00\x00\x00' @ 0 : 0; will stop at (end)

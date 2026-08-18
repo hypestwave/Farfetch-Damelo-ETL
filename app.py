@@ -407,7 +407,7 @@ def extract_sizes(page):
 
                 text = btn.inner_text().strip()
 
-                if re.search(r"\d+(\.\d+)?\s?(EU|US|UK|CM)", text.upper()):
+                if re.search(r"\d+(\.\d+)?\s?(EU|US|UK|CM|IT)", text.upper()):
 
                     sizes.append(text)
 
@@ -420,10 +420,38 @@ def extract_sizes(page):
     return list(dict.fromkeys(sizes))
 
 
+def normalize_size(size_text):
+
+    if not size_text:
+        return ""
+
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([A-Za-z]{2})?", size_text.strip())
+    if not match:
+        return size_text.strip()
+
+    number = match.group(1)
+    scale = (match.group(2) or "").upper()
+
+    return f"{number} {scale}".strip()
+
+
+def extract_option_price(option_text):
+
+    if not option_text:
+        return 0
+
+    match = re.search(r"(?:COP\s*)?\$\s*[\d.,]+|COP\s*[\d.,]+", option_text, re.IGNORECASE)
+    if not match:
+        return 0
+
+    return clean_price(match.group(0))
+
+
 def extract_size_inventory(page):
 
     sizes = []
     quantities = []
+    prices = []
 
     try:
         selector = page.locator("[data-testid='ScaledSizeSelector'] [role='combobox']").first
@@ -447,15 +475,15 @@ def extract_size_inventory(page):
                 except:
                     size_text = option_text
 
-                match = re.search(r"\d+(?:\.\d+)?", size_text)
-                if not match:
+                size = normalize_size(size_text)
+                if not size:
                     continue
 
-                size = match.group(0)
                 if size in sizes:
                     continue
 
                 sizes.append(size)
+                prices.append(extract_option_price(option_text))
                 normalized = normalize_text(option_text)
                 quantities.append(1 if "ultima pieza" in normalized else 2)
 
@@ -468,9 +496,9 @@ def extract_size_inventory(page):
     if not sizes:
         sizes = extract_sizes(page)
         quantities = [2] * len(sizes)
+        prices = [0] * len(sizes)
 
-    return sizes, quantities
-
+    return sizes, quantities, prices
 
 # =========================
 # IMAGES
@@ -705,7 +733,7 @@ def scrape_product(page, url):
         # SIZES
         # =========================
 
-        sizes, quantities = extract_size_inventory(page)
+        sizes, quantities, size_prices = extract_size_inventory(page)
 
         # =========================
         # CATEGORY
@@ -736,7 +764,7 @@ def scrape_product(page, url):
 
             "department": extract_department(url),
 
-            "price": price,
+            "price": json.dumps([p if p > 0 else price for p in size_prices], ensure_ascii=False) if sizes else price,
 
             "currency": "COP",
 
